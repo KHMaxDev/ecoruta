@@ -84,6 +84,56 @@ class InegiRNCGeospatialETL:
         value = (circulation or "").lower()
         return ("dos" in value) or ("ambos" in value) or ("bidirec" in value)
 
+    def compute_effective_slope_rad(self, geom: Any, length_m: float) -> Tuple[float, float]:
+        """Muestrea el DEM cada 50 metros a lo largo del segmento vial.
+
+        Un cálculo de extremos (``atan2(h_v - h_u, L)``) reporta pendiente 0 para
+        cualquier tramo que suba una loma y regrese a la misma altitud, ignorando
+        brutalmente el gasto energético. Aquí se acumulan los desniveles positivos y
+        negativos de cada tramo interior y se convierte a una pendiente *efectiva*
+        energética conservadora.
+
+        Returns:
+            ``(slope_forward_rad, slope_reverse_rad)`` acotados a ±0.25 rad.
+        """
+        from shapely.geometry import LineString, MultiLineString
+
+        base_line = geom if isinstance(geom, LineString) else geom.geoms[0]
+        num_samples = max(2, min(40, int(length_m // 50.0) + 1))
+
+        elevations: List[float] = []
+        for i in range(num_samples):
+            frac = i / (num_samples - 1)
+            pt = base_line.interpolate(frac, normalized=True)
+            elevations.append(self.sample_elevation_m(pt.x, pt.y))
+
+        pos_gain_m = sum(
+            max(0.0, elevations[i + 1] - elevations[i]) for i in range(len(elevations) - 1)
+        )
+        neg_loss_m = sum(
+            max(0.0, elevations[i] - elevations[i + 1]) for i in range(len(elevations) - 1)
+        )
+
+        # 0.35 = fracción del descenso que no "paga" el ascenso previo (pérdida neta
+        # energética conservadora) por frena-des-aceleración y rendimiento de motor.
+        net_delta_fwd = pos_gain_m - 0.35 * neg_loss_m
+        net_delta_rev = neg_loss_m - 0.35 * pos_gain_m
+
+        slope_fwd = max(-SLOPE_LIMIT_RAD, min(SLOPE_LIMIT_RAD, math.atan2(net_delta_fwd, length_m)))
+        slope_rev = max(-SLOPE_LIMIT_RAD, min(SLOPE_LIMIT_RAD, math.atan2(net_delta_rev, length_m)))
+        return slope_fwd, slope_rev
+
+    @staticmethod
+    def _insert_batch(conn: Any, sql: str, params: List[Dict[str, Any]], label: str) -> None:
+        """Inserción por lotes (executemany) para evitar 1 round-trip por fila."""
+        batch_size = 10_000
+        total = 0
+        for start in range(0, len(params), batch_size):
+            chunk = params[start:start + batch_size]
+            conn.execute(text(sql), chunk)
+            total += len(chunk)
+        logger.debug("Insertados %d registros de %s", total, label)
+
     def process_and_load_rnc(
         self,
         rnc_roads_path: str,
@@ -134,8 +184,8 @@ class InegiRNCGeospatialETL:
                 continue
 
             (lon1, lat1), (lon2, lat2) = self.extract_endpoints(geom)
-            u_id, elev_u = get_or_create_node(lon1, lat1)
-            v_id, elev_v = get_or_create_node(lon2, lat2)
+            u_id, _elev_u = get_or_create_node(lon1, lat1)
+            v_id, _elev_v = get_or_create_node(lon2, lat2)
             if u_id == v_id:
                 continue
 
@@ -143,9 +193,9 @@ class InegiRNCGeospatialETL:
             if length_m <= 1.0:
                 length_m = max(10.0, float(geom.length) * 111320.0)
 
-            delta_h = elev_v - elev_u
-            slope_uv = max(-SLOPE_LIMIT_RAD, min(SLOPE_LIMIT_RAD, math.atan2(delta_h, length_m)))
-            slope_vu = -slope_uv
+            # Muestreo longitudinal cada 50 m: evita la "colina oculta" del
+            # cálculo por extremos (h_v - h_u == 0 => pendiente 0 falsa).
+            slope_uv, slope_vu = self.compute_effective_slope_rad(geom, length_m)
 
             speed_kmh = float(row.get("VELOCIDAD", 60.0) or 60.0)
             road_name = str(row.get("NOMBRE", "Vialidad s/n") or "Vialidad s/n")
@@ -183,20 +233,21 @@ class InegiRNCGeospatialETL:
 
         with self.engine.begin() as conn:
             logger.info("Insertando %d nodos topológicos con elevación DEM...", len(nodes_to_insert))
-            for n in nodes_to_insert:
-                conn.execute(
-                    text("""
-                        INSERT INTO road_nodes (id, elevation_m, geom)
-                        VALUES (:id, :elevation_m, ST_SetSRID(ST_MakePoint(:lon, :lat), 4326))
-                        ON CONFLICT (id) DO NOTHING;
-                    """),
-                    n,
-                )
+            self._insert_batch(
+                conn,
+                """
+                    INSERT INTO road_nodes (id, elevation_m, geom)
+                    VALUES (:id, :elevation_m, ST_SetSRID(ST_MakePoint(:lon, :lat), 4326))
+                    ON CONFLICT (id) DO NOTHING;
+                """,
+                nodes_to_insert,
+                "road_nodes",
+            )
 
-            logger.info("Insertando %d aristas dirigidas enriquecidas...", len(edges_to_insert))
-            for e in edges_to_insert:
-                conn.execute(
-                    text("""
+            logger.info("Insertando %d aristas dirigidas enriquecidas (lotes de 10 000)...", len(edges_to_insert))
+            self._insert_batch(
+                conn,
+                """
                         INSERT INTO road_edges (
                             source, target, rnc_id, road_name, road_class,
                             length_m, slope_rad, free_flow_speed_kmh,
@@ -207,9 +258,10 @@ class InegiRNCGeospatialETL:
                             :toll_cost_autos_mxn, :toll_cost_truck_5axles_mxn,
                             ST_GeomFromText(:wkt, 4326)
                         );
-                    """),
-                    e,
-                )
+                """,
+                edges_to_insert,
+                "road_edges",
+            )
 
             logger.info("Generando series horarias de velocidad inicial (24h)...")
             conn.execute(

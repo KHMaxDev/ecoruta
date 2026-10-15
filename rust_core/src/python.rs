@@ -3,6 +3,8 @@
 //! nombre `ecoruta_core` mediante clases envoltorio con nombre público idéntico.
 use pyo3::prelude::*;
 
+use std::sync::Arc;
+
 use crate::fifo::{interpolate_fifo_travel_time, regularize_hourly_times_fifo};
 use crate::physics::{compute_edge_energy_units, VehicleParams};
 use crate::td_mols::{solve_core, EdgeData, ParetoRoute};
@@ -208,7 +210,13 @@ impl PyParetoRoute {
 }
 
 /// Time-Dependent Multi-Objective Label-Setting (TD-MOLS) expuesto a Python.
+///
+/// `max_runtime_ms` (opcional, por defecto `None`) es un *watchdog* en
+/// milisegundos: si se agota, se devuelve la mejor frontera encontrada.
 #[pyfunction]
+#[pyo3(signature = (edges, vehicle, source_node, target_node, dest_lon, dest_lat,
+                    departure_time_s, air_density, max_labels_per_node, epsilon_rel,
+                    max_runtime_ms = None))]
 #[allow(clippy::too_many_arguments)]
 pub fn solve_td_mols<'py>(
     edges: Vec<Bound<'py, PyEdgeData>>,
@@ -221,6 +229,7 @@ pub fn solve_td_mols<'py>(
     air_density: f64,
     max_labels_per_node: usize,
     epsilon_rel: f64,
+    max_runtime_ms: Option<u64>,
 ) -> Vec<PyParetoRoute> {
     let core_edges: Vec<EdgeData> = edges.iter().map(|e| e.borrow().to_core()).collect();
     solve_core(
@@ -234,6 +243,7 @@ pub fn solve_td_mols<'py>(
         air_density,
         max_labels_per_node,
         epsilon_rel,
+        max_runtime_ms,
     )
     .into_iter()
     .map(PyParetoRoute::from_core)
@@ -279,11 +289,102 @@ pub fn compute_energy_units(
     )
 }
 
+/// Grafo vial persistente en memoria (auditoría 7.1: *Zero-Copy Querying*).
+///
+/// El grafo se carga **una sola vez** (p. ej. en el *lifespan* de FastAPI) y
+/// todas las peticiones HTTP reutilizan la misma copia compartida mediante `Arc`,
+/// en lugar de reconstruir `Vec<EdgeData>` desde PostGIS por cada request.
+///
+/// El GIL se libera durante la búsqueda (`py.allow_threads`), de modo que las
+/// peticiones concurrentes de Uvicorn *worker threads* ejecutan la búsqueda en
+/// paralelo real sobre el mismo grafo.
+#[pyclass(name = "RoadGraphEngine", frozen)]
+pub struct PyRoadGraphEngine {
+    edges: Arc<Vec<EdgeData>>,
+    node_count: usize,
+    edge_count: usize,
+}
+
+#[pymethods]
+impl PyRoadGraphEngine {
+    /// Carga el grafo completo una sola vez al arrancar el servicio.
+    #[new]
+    pub fn new(edges: Vec<Bound<'_, PyEdgeData>>) -> Self {
+        let core_edges: Vec<EdgeData> = edges.iter().map(|e| e.borrow().to_core()).collect();
+        let mut node_count: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for e in &core_edges {
+            node_count.insert(e.source);
+            node_count.insert(e.target);
+        }
+        let n = node_count.len();
+        let m = core_edges.len();
+        Self {
+            edges: Arc::new(core_edges),
+            node_count: n,
+            edge_count: m,
+        }
+    }
+
+    /// Resuelve la frontera de Pareto de un par origen-destino sobre el grafo residente.
+    #[pyo3(signature = (vehicle, source_node, target_node, dest_lon, dest_lat,
+                        departure_time_s, air_density, max_labels_per_node, epsilon_rel,
+                        max_runtime_ms = None))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn query_pareto(
+        &self,
+        py: Python<'_>,
+        vehicle: Bound<'_, PyVehicleParams>,
+        source_node: u64,
+        target_node: u64,
+        dest_lon: f64,
+        dest_lat: f64,
+        departure_time_s: f64,
+        air_density: f64,
+        max_labels_per_node: usize,
+        epsilon_rel: f64,
+        max_runtime_ms: Option<u64>,
+    ) -> Vec<PyParetoRoute> {
+        let edges_ref = Arc::clone(&self.edges);
+        let veh = vehicle.borrow().to_core();
+        // Libera el GIL (`detach` en PyO3 ≥0.26; era `allow_threads`):
+        // la búsqueda corre en paralelo real con el intérprete.
+        let routes = py.detach(move || {
+            solve_core(
+                (*edges_ref).clone(),
+                veh,
+                source_node,
+                target_node,
+                dest_lon,
+                dest_lat,
+                departure_time_s,
+                air_density,
+                max_labels_per_node,
+                epsilon_rel,
+                max_runtime_ms,
+            )
+        });
+        routes.into_iter().map(PyParetoRoute::from_core).collect()
+    }
+
+    /// Número de nodos residentes (auditoría/telemetría).
+    #[getter]
+    pub fn node_count(&self) -> usize {
+        self.node_count
+    }
+
+    /// Número de aristas residentes (auditoría/telemetría).
+    #[getter]
+    pub fn edge_count(&self) -> usize {
+        self.edge_count
+    }
+}
+
 #[pymodule]
 fn ecoruta_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyVehicleParams>()?;
     m.add_class::<PyEdgeData>()?;
     m.add_class::<PyParetoRoute>()?;
+    m.add_class::<PyRoadGraphEngine>()?;
     m.add_function(wrap_pyfunction!(solve_td_mols, m)?)?;
     m.add_function(wrap_pyfunction!(regularize_fifo, m)?)?;
     m.add_function(wrap_pyfunction!(interpolate_fifo, m)?)?;

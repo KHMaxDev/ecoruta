@@ -156,6 +156,10 @@ pub struct ParetoRoute {
 /// heurística admisible A*, poda global contra el frente del nodo destino y
 /// epsilon-dominancia configurable.
 ///
+/// `max_runtime_ms` es un *watchdog* opcional: si se excede, el algoritmo detiene
+/// la expansión y devuelve la mejor frontera de Pareto descubierta hasta ese
+/// instante (*best effort* con presupuesto de tiempo).
+///
 /// Núcleo en Rust puro (sin dependencia de Python); la exponen tanto los tests
 /// de equivalencia con fuerza bruta como el wrapper `solve_td_mols` de `python.rs`.
 #[allow(clippy::too_many_arguments)]
@@ -170,7 +174,9 @@ pub fn solve_core(
     air_density: f64,
     max_labels_per_node: usize,
     epsilon_rel: f64,
+    max_runtime_ms: Option<u64>,
 ) -> Vec<ParetoRoute> {
+    let started_at = std::time::Instant::now();
     let mut adj: HashMap<u64, Vec<usize>> = HashMap::new();
     let mut min_energy_price = f64::INFINITY;
     for (idx, edge) in edges.iter().enumerate() {
@@ -207,6 +213,14 @@ pub fn solve_core(
     open_heap.push(init_label);
 
     while let Some(curr) = open_heap.pop() {
+        // Watchdog: si se agota el presupuesto de tiempo, se devuelve la mejor
+        // frontera descubierta hasta ahora (nunca se aborta la petición).
+        if let Some(max_ms) = max_runtime_ms {
+            if started_at.elapsed().as_millis() > u128::from(max_ms) {
+                break;
+            }
+        }
+
         let curr_pool_idx = match pareto_at_node.get(&curr.node) {
             Some(list) => {
                 if let Some(&(_, _, idx)) = list.iter().find(|&&(c, t, _)| {
@@ -362,7 +376,7 @@ mod tests {
             EdgeData::new(5, 2, 3, -99.1, 19.3, 8000.0, 0.03, 25.0, 24.0, vec![40.0; 24], 0.15, 0.0),
         ];
 
-        let pareto = solve_core(edges, veh, 1, 4, -99.0, 19.4, 28800.0, 1.05, 50, 0.0);
+        let pareto = solve_core(edges, veh, 1, 4, -99.0, 19.4, 28800.0, 1.05, 50, 0.0, None);
 
         // Deben existir exactamente 2 soluciones no dominadas (Camino B barato y Camino A rápido)
         assert_eq!(pareto.len(), 2, "se esperaban 2 soluciones no dominadas");
@@ -461,7 +475,7 @@ mod tests {
         brute_front.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-6 && (a.1 - b.1).abs() < 1e-6);
 
         // --- Resultado del algoritmo ---
-        let algo = solve_core(edges, veh, 1, 4, -99.0, 19.4, departure, air_density, 50, 0.0);
+        let algo = solve_core(edges, veh, 1, 4, -99.0, 19.4, departure, air_density, 50, 0.0, None);
         let algo_front: Vec<(f64, f64)> = algo.iter().map(|r| (r.total_cost_mxn, r.total_time_s)).collect();
 
         assert_eq!(
@@ -472,5 +486,38 @@ mod tests {
             assert!((a.0 - b.0).abs() < 1e-6, "costo difiere: {:?} vs {:?}", a, b);
             assert!((a.1 - b.1).abs() < 1e-6, "tiempo difiere: {:?} vs {:?}", a, b);
         }
+    }
+
+    /// El *watchdog* (`max_runtime_ms`) debe cortar la expansión sin paniquear
+    /// y devolver la mejor frontera descubierta hasta ese instante.
+    #[test]
+    fn test_watchdog_timeout_returns_partial_front() {
+        let veh = VehicleParams::new(false, 1350.0, 2.15, 0.30, 0.012, 0.28, 0.0, 1200.0, 500.0, 32.1e6, 1.0);
+
+        let make_edges = || {
+            vec![
+                EdgeData::new(1, 1, 2, -99.1, 19.4, 15000.0, 0.01, 90.0, 24.0, vec![100.0; 24], 0.02, 0.0),
+                EdgeData::new(2, 2, 4, -99.0, 19.4, 15000.0, 0.00, 0.0, 24.0, vec![100.0; 24], 0.02, 0.0),
+                EdgeData::new(3, 1, 3, -99.1, 19.3, 16000.0, 0.02, 0.0, 24.0, vec![65.0; 24], 0.08, 0.0),
+                EdgeData::new(4, 3, 4, -99.0, 19.4, 16000.0, -0.01, 0.0, 24.0, vec![65.0; 24], 0.08, 0.0),
+                EdgeData::new(5, 2, 3, -99.1, 19.3, 8000.0, 0.03, 25.0, 24.0, vec![40.0; 24], 0.15, 0.0),
+            ]
+        };
+
+        // Presupuesto 0 ms: la primera comprobación corta antes de expandir.
+        let started = std::time::Instant::now();
+        let timed_out = solve_core(make_edges(), veh.clone(), 1, 4, -99.0, 19.4, 28800.0, 1.05, 50, 0.0, Some(0));
+        assert!(
+            started.elapsed().as_millis() < 1_000,
+            "el watchdog debe abortar la expansión de inmediato"
+        );
+        assert!(
+            timed_out.len() <= 2,
+            "el resultado parcial nunca puede exceder la frontera completa"
+        );
+
+        // Sin presupuesto se obtiene la frontera completa (2 soluciones).
+        let unlimited = solve_core(make_edges(), veh, 1, 4, -99.0, 19.4, 28800.0, 1.05, 50, 0.0, None);
+        assert_eq!(unlimited.len(), 2, "sin watchdog debe devolver la frontera completa");
     }
 }
