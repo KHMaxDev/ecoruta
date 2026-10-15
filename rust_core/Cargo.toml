@@ -1,0 +1,29 @@
+[package]
+name = "ecoruta_core"
+version = "0.1.0"
+edition = "2021"
+description = "Núcleo algorítmico TD-MOLS de EcoRuta: física longitudinal, regularización FIFO y etiquetado bi-objetivo."
+license = "MIT"
+
+[lib]
+name = "ecoruta_core"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# La feature `python` habilita los enlaces PyO3. Está en `default` porque maturin
+# la requiere para construir el módulo `ecoruta_core`. Los tests de equivalencia
+# se ejecutan con `cargo test --release --no-default-features`, de modo que el
+# núcleo algorítmico compila como Rust puro sin requerir libpython ni MSVC.
+default = ["python"]
+python = ["dep:pyo3"]
+# Maturin habilita automáticamente `extension-module` al empaquetar.
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+pyo3 = { version = "0.30", optional = true }
+serde = { version = "1.0", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,9 @@
+# EcoRuta — dependencias del pipeline ETL geoespacial y verificación de esquema
+# Instalar en el virtualenv raíz: pip install -r scripts/requirements.txt
+geopandas>=1.0.0
+shapely>=2.0.0
+rasterio>=1.3.9
+pyproj>=3.6.0
+SQLAlchemy>=2.0.30
+psycopg2-binary>=2.9.9
+fiona>=1.9.6

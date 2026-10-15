@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "ecoruta_core"
+version = "0.1.0"
+description = "Núcleo algorítmico TD-MOLS de EcoRuta (Rust + PyO3)."
+requires-python = ">=3.12"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[tool.maturin]
+# El crate expone el módulo `ecoruta_core` (nombre del #[pymodule]).
+module-name = "ecoruta_core"
+features = ["extension-module"]

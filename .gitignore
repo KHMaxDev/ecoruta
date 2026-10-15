@@ -1,0 +1,70 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg
+env/
+ENV/
+
+# --- Rust ---
+rust_core/target/
+rust_core/dist/
+**/*.rs.bk
+Cargo.lock
+
+# --- Node / Frontend ---
+node_modules/
+frontend/dist/
+frontend/.vite/
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Entorno y secretos ---
+.env
+.env.*
+!.env.example
+
+# --- Datos pesados / geoespaciales ---
+*.pbf
+*.osm
+*.osm.pbf
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.geojson
+*.geotiff
+*.tif
+*.tiff
+*.hgt
+valhalla_tiles/
+*.net.xml
+*.rou.xml
+data/raw/
+data/processed/
+
+# --- Bases de datos locales / volúmenes ---
+*.sqlite
+*.sqlite3
+pgdata/
+
+# --- Sistema operativo / editor ---
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*~
+
+# --- Reportes generados ---
+simulation/reports/*.csv
+simulation/reports/*.md
